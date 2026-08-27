@@ -1,0 +1,997 @@
+## 1. Ý tưởng tổng thể
+
+Hệ thống vẫn giữ phần lõi là **AI Agent tự động hỗ trợ điều tra sự cố an toàn thông tin** từ các alert do SIEM hoặc các thiết bị bảo mật tạo ra.
+
+Phần Web chỉ là một thành phần bổ sung để:
+
+* hiển thị các Case đã được Agent điều tra;
+* cho phép người dùng đặt câu hỏi bằng ngôn ngữ tự nhiên;
+* hỗ trợ truy vấn lại thông tin từ Case đã có;
+* khi cần thì chuyển câu hỏi thành truy vấn SIEM để lấy thêm dữ liệu.
+
+Có thể hiểu hệ thống gồm **2 vòng hoạt động bổ trợ cho nhau**:
+
+```text
+Vòng 1: Agent tự động điều tra sự cố
+Alert
+  ↓
+Agent Investigation
+  ↓
+Thu thập Evidence
+  ↓
+Correlation
+  ↓
+LLM Reasoning
+  ↓
+Case
+
+
+Vòng 2: Người dùng tiếp tục điều tra qua Web
+User Question
+  ↓
+Query Agent
+  ↓
+Kiểm tra dữ liệu đã có trong Case
+  ↓
+Nếu đủ → dùng lại
+Nếu thiếu → truy vấn SIEM
+  ↓
+Phân tích kết quả
+  ↓
+Trả lời người dùng
+```
+
+---
+
+## 2. Luồng xử lý khi xảy ra một cuộc tấn công
+
+Ví dụ có một kẻ tấn công:
+
+* khai thác một máy chủ;
+* chạy mã độc;
+* thực thi command;
+* kết nối tới C2;
+* hoặc lấy cắp dữ liệu.
+
+Các thiết bị bảo mật và SIEM sẽ phát hiện những hành vi bất thường và tạo ra Alert.
+
+```text
+Attacker
+   ↓
+Endpoint / Network / Security Device
+   ↓
+SIEM
+   ↓
+Alerts
+```
+
+AI Agent nhận Alert và bắt đầu quá trình điều tra.
+
+Agent có thể thực hiện:
+
+* xác định máy bị tấn công;
+* xác định IP nghi vấn;
+* tìm process bất thường;
+* tìm command được thực thi;
+* tìm kết nối mạng;
+* tìm IOC;
+* tìm các Alert khác có liên quan;
+* phân tích timeline;
+* tương quan các evidence.
+
+Luồng:
+
+```text
+Alert
+  ↓
+Triage
+  ↓
+Host Evidence
+  ↓
+Network Evidence
+  ↓
+Related Alerts
+  ↓
+Correlation
+  ↓
+LLM Reasoning
+  ↓
+Case
+```
+
+Phần này chính là phần lõi của hệ thống trước đó.
+
+---
+
+## 3. Thay đổi quan trọng: từ Report sang Case
+
+Trước đây sau khi Agent phân tích xong:
+
+```text
+Investigation
+     ↓
+Incident Report
+     ↓
+Kết thúc
+```
+
+Trong hệ thống mới, Agent sẽ không chỉ tạo một báo cáo tĩnh.
+
+Thay vào đó, tất cả kết quả điều tra được tổng hợp thành một **Case**.
+
+```text
+Investigation
+     ↓
+Case
+```
+
+Một Case có thể chứa:
+
+```text
+CASE-001
+│
+├── Thông tin tổng quan
+│
+├── Severity
+│
+├── Initial Alert
+│
+├── Related Alerts
+│
+├── Victim Host
+│
+├── Attacker IP
+│
+├── Process
+│
+├── File / Malware
+│
+├── IOC
+│
+├── Timeline
+│
+├── Evidence
+│
+├── Findings
+│
+├── SIEM Queries đã sử dụng
+│
+└── Kết quả của các Query
+```
+
+Ví dụ:
+
+```text
+CASE-001
+
+Severity:
+Critical
+
+Victim:
+web-server-01
+
+Attacker IP:
+40.80.148.42
+
+Malware:
+3791.exe
+
+Related Alerts:
+- php-cgi.exe tạo cmd.exe
+- suspicious executable
+- abnormal network connection
+- C2 communication
+
+IOC:
+- 40.80.148.42
+- 3791.exe
+- malicious-domain.com
+```
+
+Case sẽ là nơi lưu toàn bộ trạng thái của quá trình điều tra.
+
+---
+
+## 4. Tại sao phải lưu Query và Query Result?
+
+Khi Agent điều tra một sự cố, Agent sẽ phải truy vấn SIEM nhiều lần.
+
+Ví dụ:
+
+```text
+Tìm process được php-cgi.exe tạo ra
+```
+
+Agent tạo SIEM query:
+
+```text
+host = victim-web
+AND parent_process = php-cgi.exe
+```
+
+SIEM trả về:
+
+```text
+php-cgi.exe
+   ↓
+cmd.exe
+   ↓
+3791.exe
+```
+
+Thông thường sau khi Agent sử dụng kết quả này để phân tích thì Query và Result có thể bị bỏ đi.
+
+Ý tưởng mới là **không bỏ chúng**.
+
+Hệ thống sẽ lưu:
+
+```text
+Query
++
+Query Result
++
+Evidence được rút ra
++
+Case liên quan
+```
+
+Ví dụ:
+
+```text
+Query ID: Q001
+
+Case:
+CASE-001
+
+SIEM Query:
+parent_process = php-cgi.exe
+
+Result:
+cmd.exe
+3791.exe
+
+Evidence:
+php-cgi.exe → cmd.exe → 3791.exe
+```
+
+Nhờ đó, thông tin mà Agent đã từng lấy từ SIEM có thể được sử dụng lại.
+
+---
+
+## 5. Case Evidence Store
+
+Hệ thống cần một nơi lưu các thông tin điều tra đã có.
+
+Có thể gọi đơn giản là:
+
+**Case Evidence Store**
+
+Nó chứa:
+
+```text
+Case
+Alerts
+Evidence
+Entities
+Timeline
+IOC
+Queries
+Query Results
+Findings
+```
+
+Ví dụ:
+
+```text
+CASE-001
+│
+├── Alert-01
+├── Alert-02
+│
+├── Evidence-01
+├── Evidence-02
+│
+├── Query-01
+├── Query-02
+│
+├── IP-01
+├── Host-01
+├── Process-01
+│
+└── Timeline
+```
+
+Mục đích là để Agent không phải truy vấn lại SIEM cho những thông tin mà hệ thống đã thu thập trước đó.
+
+---
+
+## 6. Vai trò của Web
+
+Web không phải là phần chính của hệ thống.
+
+Web chỉ là **giao diện giúp analyst xem và tiếp tục điều tra Case**.
+
+Một Web đơn giản có thể có:
+
+```text
+Dashboard
+
+Cases
+
+Case Detail
+
+Search / Ask AI
+```
+
+Ví dụ trang Case:
+
+```text
+CASE-001
+
+Overview
+
+Alerts
+
+Timeline
+
+Evidence
+
+IOC
+
+Queries
+
+Ask AI
+```
+
+Người dùng có thể mở một Case để xem những gì Agent đã phân tích được.
+
+---
+
+## 7. Thanh truy vấn bằng ngôn ngữ tự nhiên
+
+Trên Web sẽ có một ô nhập câu hỏi.
+
+Ví dụ:
+
+```text
+"3791.exe được thực thi như thế nào?"
+```
+
+hoặc:
+
+```text
+"Những alert nào liên quan tới IP 40.80.148.42?"
+```
+
+hoặc:
+
+```text
+"Attacker đã làm gì sau khi chiếm được máy?"
+```
+
+AI Query Agent sẽ phân tích câu hỏi.
+
+---
+
+## 8. Query Agent hoạt động như thế nào?
+
+Luồng đơn giản:
+
+```text
+User Question
+      ↓
+Query Agent
+      ↓
+Hiểu câu hỏi
+      ↓
+Xác định Case / Entity / Time
+      ↓
+Tìm trong Case Evidence Store
+```
+
+Sau đó có hai trường hợp.
+
+### Trường hợp 1: dữ liệu đã có
+
+Ví dụ người dùng hỏi:
+
+```text
+"3791.exe được tạo bởi process nào?"
+```
+
+Trong Case đã có:
+
+```text
+php-cgi.exe
+   ↓
+cmd.exe
+   ↓
+3791.exe
+```
+
+Agent không cần truy vấn SIEM.
+
+```text
+User Question
+      ↓
+Case Evidence Store
+      ↓
+Evidence đã có
+      ↓
+LLM tổng hợp
+      ↓
+Answer
+```
+
+Điều này giúp:
+
+* phản hồi nhanh hơn;
+* giảm truy vấn SIEM;
+* không làm lại những công việc Agent đã làm;
+* giữ được đầy đủ context của cuộc điều tra.
+
+---
+
+## 9. Trường hợp dữ liệu chưa đủ
+
+Ví dụ người dùng hỏi:
+
+```text
+"IP của attacker có xuất hiện trên máy nào khác trong 24 giờ gần đây không?"
+```
+
+Case hiện tại chỉ biết:
+
+```text
+Attacker IP:
+40.80.148.42
+```
+
+Nhưng Case không có thông tin về các máy khác trong 24 giờ hiện tại.
+
+Lúc này Agent phải lấy IP từ Case:
+
+```text
+40.80.148.42
+```
+
+sau đó tạo query mới cho SIEM.
+
+```text
+Case
+  ↓
+Extract attacker IP
+  ↓
+Generate SIEM Query
+  ↓
+Wazuh
+  ↓
+Result
+  ↓
+LLM Analysis
+```
+
+Đây là một kiểu **Hybrid Query**.
+
+Agent vừa sử dụng kiến thức cũ trong Case, vừa truy vấn dữ liệu mới từ SIEM.
+
+---
+
+## 10. Các loại Query hệ thống nên hỗ trợ
+
+Không cần hỗ trợ mọi loại câu hỏi.
+
+Có thể tập trung vào một số nhóm chính.
+
+### Case Query
+
+Ví dụ:
+
+```text
+"Case này liên quan tới những IP nào?"
+```
+
+Dữ liệu lấy từ Case.
+
+---
+
+### Evidence Query
+
+Ví dụ:
+
+```text
+"Tại sao hệ thống cho rằng 3791.exe nguy hiểm?"
+```
+
+Dữ liệu lấy từ Evidence Store.
+
+---
+
+### Timeline Query
+
+Ví dụ:
+
+```text
+"Điều gì xảy ra sau khi webshell được chạy?"
+```
+
+Dữ liệu lấy từ Timeline của Case.
+
+---
+
+### Alert Query
+
+Ví dụ:
+
+```text
+"Những alert nào liên quan tới attacker IP?"
+```
+
+Dữ liệu lấy từ Alert của Case.
+
+---
+
+### SIEM Query
+
+Ví dụ:
+
+```text
+"Tìm tất cả PowerShell bất thường trên host WIN10 trong 1 giờ gần đây."
+```
+
+Agent tạo query mới và truy vấn SIEM.
+
+---
+
+### Hybrid Query
+
+Ví dụ:
+
+```text
+"C2 domain của Case này có xuất hiện trên host nào khác không?"
+```
+
+Agent:
+
+```text
+Case
+ ↓
+Lấy C2 Domain
+ ↓
+SIEM Query
+ ↓
+Tìm host khác
+ ↓
+Trả kết quả
+```
+
+---
+
+## 11. Cơ chế quyết định có cần truy vấn SIEM hay không
+
+Không phải câu hỏi nào liên quan tới Case cũng dùng dữ liệu cũ.
+
+Agent phải kiểm tra:
+
+```text
+User Question
+      ↓
+Case có dữ liệu liên quan?
+      ↓
+Evidence có đủ để trả lời?
+```
+
+Nếu đủ:
+
+```text
+Reuse Existing Evidence
+```
+
+Nếu không đủ:
+
+```text
+Query SIEM
+```
+
+Luồng:
+
+```text
+             User Query
+                 ↓
+             Query Agent
+                 ↓
+        Search Case Evidence
+                 ↓
+          Evidence đủ?
+             /       \
+           YES        NO
+            │          │
+            ▼          ▼
+         Reuse       SIEM
+            │          │
+            └────┬─────┘
+                 ↓
+             LLM Analysis
+                 ↓
+               Answer
+```
+
+---
+
+## 12. Kết quả Query mới cũng được lưu lại
+
+Nếu Agent phải truy vấn SIEM để trả lời một câu hỏi mới thì kết quả đó không nên bị bỏ.
+
+Ví dụ:
+
+```text
+User:
+"Attacker IP có xuất hiện ở máy nào khác không?"
+```
+
+Agent query SIEM và phát hiện:
+
+```text
+Host-02
+Host-03
+```
+
+Kết quả mới có thể được lưu lại:
+
+```text
+Query Q010
+Result
+Evidence
+```
+
+và nếu có liên quan đến Case thì có thể bổ sung vào Case.
+
+Như vậy:
+
+```text
+Case
+ ↓
+User Query
+ ↓
+SIEM
+ ↓
+New Evidence
+ ↓
+Update Case
+```
+
+Case trở thành một trạng thái điều tra có thể tiếp tục được mở rộng.
+
+---
+
+## 13. Các thành phần chính của hệ thống
+
+Có thể chia thành các thành phần sau.
+
+### 1. SIEM
+
+Ví dụ:
+
+```text
+Wazuh
+```
+
+Nhiệm vụ:
+
+* thu thập log;
+* lưu dữ liệu;
+* detection;
+* tạo alert;
+* cung cấp API/query để tìm dữ liệu.
+
+---
+
+### 2. Investigation Agent
+
+Đây là phần lõi của hệ thống.
+
+Nhiệm vụ:
+
+* nhận alert;
+* triage;
+* xác định đối tượng cần điều tra;
+* tìm evidence;
+* tìm related alert;
+* điều tra host;
+* điều tra network;
+* correlation;
+* reasoning.
+
+---
+
+### 3. Host Evidence Analyzer
+
+Tìm các thông tin như:
+
+```text
+Process
+Parent Process
+Command Line
+User
+File
+Hash
+Registry
+Sysmon Event
+```
+
+---
+
+### 4. Network Evidence Analyzer
+
+Tìm:
+
+```text
+Source IP
+Destination IP
+Port
+DNS
+Domain
+Connection
+Traffic
+C2
+```
+
+---
+
+### 5. Correlation Engine
+
+Liên kết các evidence.
+
+Ví dụ:
+
+```text
+Alert
+ ↓
+Host
+ ↓
+Process
+ ↓
+IP
+ ↓
+Network Connection
+ ↓
+C2
+```
+
+---
+
+### 6. Case Builder
+
+Sau khi có đủ thông tin, hệ thống tạo Case.
+
+Case Builder tổng hợp:
+
+```text
+Alerts
+Entities
+Evidence
+IOC
+Timeline
+Findings
+Queries
+Query Results
+Severity
+```
+
+---
+
+### 7. Case Database / Evidence Store
+
+Lưu:
+
+```text
+Case
+Alerts
+Evidence
+Entities
+Queries
+Query Results
+Timeline
+IOC
+```
+
+Có thể sử dụng SQLite ở prototype.
+
+---
+
+### 8. Query Agent
+
+Nhận câu hỏi từ người dùng.
+
+Nhiệm vụ:
+
+```text
+Hiểu câu hỏi
+
+Xác định intent
+
+Xác định Case
+
+Extract entity
+
+Kiểm tra evidence cũ
+
+Quyết định:
+reuse evidence
+hoặc
+query SIEM
+
+Phân tích kết quả
+
+Trả lời
+```
+
+---
+
+### 9. SIEM Query Engine
+
+Nếu cần dữ liệu mới, Query Agent sử dụng thành phần này.
+
+Nó có nhiệm vụ:
+
+```text
+Natural Language
+      ↓
+Query Plan
+      ↓
+SIEM Query
+      ↓
+Validate
+      ↓
+Execute
+      ↓
+Result
+```
+
+---
+
+### 10. Web Interface
+
+Hiển thị:
+
+```text
+Cases
+Alerts
+Evidence
+Timeline
+IOC
+Query History
+```
+
+và cung cấp:
+
+```text
+Ask AI
+```
+
+để analyst tiếp tục điều tra.
+
+---
+
+## 14. Kiến trúc tổng thể
+
+```text
+        Endpoint / Network / Security Devices
+                       │
+                       ▼
+                     SIEM
+                    Wazuh
+                       │
+                    Alerts
+                       │
+                       ▼
+              Investigation Agent
+                       │
+         ┌─────────────┴─────────────┐
+         │                           │
+         ▼                           ▼
+   Host Evidence               Network Evidence
+         │                           │
+         └─────────────┬─────────────┘
+                       ▼
+                  Correlation
+                       │
+                       ▼
+                  LLM Reasoning
+                       │
+                       ▼
+                   Case Builder
+                       │
+                       ▼
+              Case Evidence Store
+                       │
+                       ▼
+                      WEB
+                       │
+                Analyst Query
+                       │
+                       ▼
+                  Query Agent
+                       │
+              ┌────────┴────────┐
+              │                 │
+              ▼                 ▼
+       Existing Evidence     SIEM Query
+              │                 │
+              │              Wazuh
+              │                 │
+              └────────┬────────┘
+                       ▼
+                  LLM Analysis
+                       │
+                       ▼
+                     Answer
+```
+
+---
+
+## 15. Điểm quan trọng của ý tưởng
+
+Phần chính của đề tài vẫn là:
+
+```text
+Alert
+ ↓
+AI Agent Investigation
+ ↓
+Evidence Collection
+ ↓
+Correlation
+ ↓
+Case
+```
+
+Web không thay thế hệ thống này.
+
+Web chỉ bổ sung thêm khả năng:
+
+```text
+Case
++
+Natural Language Query
++
+SIEM Query
++
+Evidence Reuse
+```
+
+Hai phần hỗ trợ cho nhau.
+
+Agent tự động điều tra và tạo ra kiến thức cho Case.
+
+Người dùng sau đó có thể sử dụng kiến thức trong Case để tiếp tục điều tra.
+
+Nếu kiến thức chưa đủ, Agent quay lại SIEM để lấy thêm dữ liệu.
+
+---
+
+## 16. Ý tưởng ngắn gọn nhất
+
+Có thể mô tả toàn bộ đề tài bằng câu sau:
+
+**Hệ thống sử dụng AI Agent để tự động phân tích các Alert từ SIEM, thu thập và tương quan Evidence để hình thành Case điều tra. Các Case này được hiển thị trên Web và tiếp tục được khai thác thông qua Query Agent. Khi người dùng đặt câu hỏi, Agent ưu tiên sử dụng lại Evidence và kết quả truy vấn đã có trong Case; nếu dữ liệu chưa đủ, Agent sẽ tự động tạo và thực hiện truy vấn mới trên SIEM, phân tích kết quả và bổ sung thông tin mới vào quá trình điều tra.**
+
+Hoặc mô tả cực ngắn:
+
+```text
+SIEM Alert
+    ↓
+AI Investigation
+    ↓
+Case
+    ↓
+Web
+    ↓
+Analyst Query
+    ↓
+Reuse Evidence / Query SIEM
+    ↓
+Answer + New Evidence
+```
+
+Như vậy phần **điều tra tự động của hệ thống cũ vẫn là lõi**, còn Web và Query Agent được bổ sung để hệ thống phù hợp hơn với hướng **“Hỗ trợ truy vấn trên SIEM có sử dụng AI Agent phục vụ việc điều tra sự cố An Toàn Thông Tin”**.
